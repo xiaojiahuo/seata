@@ -16,28 +16,32 @@
 package io.seata.rm.datasource.exec;
 
 import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
+import java.sql.DatabaseMetaData;
+import java.sql.SQLException;
 import java.sql.Savepoint;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.List;
 
 import io.seata.common.util.StringUtils;
 import io.seata.core.context.RootContext;
-import io.seata.rm.datasource.ParametersHolder;
 import io.seata.rm.datasource.StatementProxy;
-import io.seata.rm.datasource.sql.SQLRecognizer;
-import io.seata.rm.datasource.sql.SQLSelectRecognizer;
 import io.seata.rm.datasource.sql.struct.TableRecords;
+import io.seata.sqlparser.SQLRecognizer;
+import io.seata.sqlparser.SQLSelectRecognizer;
+import io.seata.sqlparser.util.JdbcConstants;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * The type Select for update executor.
  *
- * @author sharajava
- *
  * @param <S> the type parameter
+ * @author sharajava
  */
 public class SelectForUpdateExecutor<T, S extends Statement> extends BaseTransactionalExecutor<T, S> {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(SelectForUpdateExecutor.class);
 
     /**
      * Instantiates a new Select for update executor.
@@ -53,101 +57,91 @@ public class SelectForUpdateExecutor<T, S extends Statement> extends BaseTransac
 
     @Override
     public T doExecute(Object... args) throws Throwable {
-        SQLSelectRecognizer recognizer = (SQLSelectRecognizer)sqlRecognizer;
-
         Connection conn = statementProxy.getConnection();
-        T rs = null;
+        DatabaseMetaData dbmd = conn.getMetaData();
+        T rs;
         Savepoint sp = null;
-        LockRetryController lockRetryController = new LockRetryController();
         boolean originalAutoCommit = conn.getAutoCommit();
-
-        StringBuffer selectSQLAppender = new StringBuffer("SELECT ");
-        selectSQLAppender.append(getColumnNameInSQL(getTableMeta().getPkName()));
-        selectSQLAppender.append(" FROM " + getFromTableInSQL());
-        String whereCondition = null;
-        ArrayList<Object> paramAppender = new ArrayList<>();
-        if (statementProxy instanceof ParametersHolder) {
-            whereCondition = recognizer.getWhereCondition((ParametersHolder)statementProxy, paramAppender);
-        } else {
-            whereCondition = recognizer.getWhereCondition();
-        }
-        if (!StringUtils.isNullOrEmpty(whereCondition)) {
-            selectSQLAppender.append(" WHERE " + whereCondition);
-        }
-        selectSQLAppender.append(" FOR UPDATE");
-        String selectPKSQL = selectSQLAppender.toString();
-
         try {
             if (originalAutoCommit) {
+                /*
+                 * In order to hold the local db lock during global lock checking
+                 * set auto commit value to false first if original auto commit was true
+                 */
                 conn.setAutoCommit(false);
+            } else if (dbmd.supportsSavepoints()) {
+                /*
+                 * In order to release the local db lock when global lock conflict
+                 * create a save point if original auto commit was false, then use the save point here to release db
+                 * lock during global lock checking if necessary
+                 */
+                sp = conn.setSavepoint();
+            } else {
+                throw new SQLException("not support savepoint. please check your db version");
             }
-            sp = conn.setSavepoint();
-            // #870
-            // execute return Boolean
-            // executeQuery return ResultSet
-            rs = statementCallback.execute(statementProxy.getTargetStatement(), args);
 
+            LockRetryController lockRetryController = new LockRetryController();
+            ArrayList<List<Object>> paramAppenderList = new ArrayList<>();
+            String selectPKSQL = buildSelectSQL(paramAppenderList);
             while (true) {
-                // Try to get global lock of those rows selected
-                Statement stPK = null;
-                PreparedStatement pstPK = null;
-                ResultSet rsPK = null;
                 try {
-                    if (paramAppender.isEmpty()) {
-                        stPK = statementProxy.getConnection().createStatement();
-                        rsPK = stPK.executeQuery(selectPKSQL);
-                    } else {
-                        pstPK = statementProxy.getConnection().prepareStatement(selectPKSQL);
-                        for (int i = 0; i < paramAppender.size(); i++) {
-                            pstPK.setObject(i + 1, paramAppender.get(i));
-                        }
-                        rsPK = pstPK.executeQuery();
-                    }
+                    // #870
+                    // execute return Boolean
+                    // executeQuery return ResultSet
+                    rs = statementCallback.execute(statementProxy.getTargetStatement(), args);
 
-                    TableRecords selectPKRows = TableRecords.buildRecords(getTableMeta(), rsPK);
+                    // Try to get global lock of those rows selected
+                    TableRecords selectPKRows = buildTableRecords(getTableMeta(), selectPKSQL, paramAppenderList);
                     String lockKeys = buildLockKey(selectPKRows);
                     if (StringUtils.isNullOrEmpty(lockKeys)) {
                         break;
                     }
 
-                    if (RootContext.inGlobalTransaction()) {
-                        //do as usual
+                    if (RootContext.inGlobalTransaction() || RootContext.requireGlobalLock()) {
+                        // Do the same thing under either @GlobalTransactional or @GlobalLock, 
+                        // that only check the global lock  here.
                         statementProxy.getConnectionProxy().checkLock(lockKeys);
-                    } else if (RootContext.requireGlobalLock()) {
-                        //check lock key before commit just like DML to avoid reentrant lock problem(no xid thus can
-                        // not reentrant)
-                        statementProxy.getConnectionProxy().appendLockKey(lockKeys);
                     } else {
                         throw new RuntimeException("Unknown situation!");
                     }
-                    
                     break;
-
                 } catch (LockConflictException lce) {
-                    conn.rollback(sp);
+                    if (sp != null) {
+                        conn.rollback(sp);
+                    } else {
+                        conn.rollback();
+                    }
+                    // trigger retry
                     lockRetryController.sleep(lce);
-
-                } finally {
-                    if (rsPK != null) {
-                        rsPK.close();
-                    }
-                    if (stPK != null) {
-                        stPK.close();
-                    }
-                    if (pstPK != null) {
-                        pstPK.close();
-                    }
                 }
             }
-
         } finally {
             if (sp != null) {
-                conn.releaseSavepoint(sp);
+                try {
+                    if (!JdbcConstants.ORACLE.equalsIgnoreCase(getDbType())) {
+                        conn.releaseSavepoint(sp);
+                    }
+                } catch (SQLException e) {
+                    LOGGER.error("{} release save point error.", getDbType(), e);
+                }
             }
             if (originalAutoCommit) {
                 conn.setAutoCommit(true);
             }
         }
         return rs;
+    }
+
+    private String buildSelectSQL(ArrayList<List<Object>> paramAppenderList) {
+        SQLSelectRecognizer recognizer = (SQLSelectRecognizer)sqlRecognizer;
+        StringBuilder selectSQLAppender = new StringBuilder("SELECT ");
+        selectSQLAppender.append(getColumnNamesInSQL(getTableMeta().getEscapePkNameList(getDbType())));
+        selectSQLAppender.append(" FROM ").append(getFromTableInSQL());
+        String whereCondition = buildWhereCondition(recognizer, paramAppenderList);
+        if (StringUtils.isNotBlank(whereCondition)) {
+            selectSQLAppender.append(" WHERE ").append(whereCondition);
+        }
+        selectSQLAppender.append(" FOR UPDATE");
+        return selectSQLAppender.toString();
     }
 }

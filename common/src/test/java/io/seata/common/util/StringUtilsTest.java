@@ -30,7 +30,6 @@ import static org.junit.jupiter.api.Assertions.assertNull;
  *
  * @author Otis.z
  * @author Geng Zhang
- * @date 2019 /2/20
  */
 public class StringUtilsTest {
 
@@ -87,5 +86,27 @@ public class StringUtilsTest {
         Assertions.assertFalse(StringUtils.equalsIgnoreCase("1", null));
         Assertions.assertFalse(StringUtils.equalsIgnoreCase("", null));
         Assertions.assertFalse(StringUtils.equalsIgnoreCase(null, ""));
+    }
+
+    @Test
+    void testCycleDependency() throws StackOverflowError{
+        StringUtils.toString(CycleDependency.A);
+    }
+
+    static class CycleDependency {
+        public static final CycleDependency A = new CycleDependency("a");
+        public static final CycleDependency B = new CycleDependency("b");
+
+        private String s;
+        private CycleDependency(String s) {
+            this.s = s;
+        }
+
+        @Override
+        public String toString() {
+            return "{" +
+                    "s='" + s + '\'' +
+                    '}';
+        }
     }
 }
